@@ -1,0 +1,27 @@
+# Build output
+# Match on extension so a local `go build` binary of any name stays out of the repo.
+*.exe
+dist/
+
+# Runtime noise
+debug.log
+*.log
+
+# Test
+*.test
+*.out
+coverage.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Propagation-check run logs (trace ids; keep out of the repo)
+propagation-check-*.log*

@@ -1,0 +1,36 @@
+# A parallax/v1 manifest: the graph Parallax walks, plus how to walk it.
+# Try it without sending anything:
+#   parallax -manifest examples/shop.yaml -dry-run
+apiVersion: parallax/v1
+kind: Manifest
+metadata:
+  name: shop
+graph:
+  nodes:
+    - name: frontend
+      owned: true          # required: Parallax never calls a node you have not claimed
+      instrumented: true
+      http:
+        baseURL: http://frontend.shop.svc.cluster.local:8080
+        routes:
+          - {method: GET, path: /healthz}
+          - {method: GET, path: /api/products}
+          - {method: POST, path: /api/cart}   # not repeat-safe: refused, shown in the dry run
+    - name: checkout
+      owned: true
+      instrumented: true
+      grpc:
+        target: checkout.shop.svc.cluster.local:9090
+        insecure: true
+        health: true
+    - name: payment-provider  # someone else's system: never called
+      http:
+        baseURL: https://api.payments.example.com
+        routes:
+          - {method: GET, path: /v1/status}
+run:
+  interval: 60s
+  timeout: 5s
+  maxCallsPerSecond: 20
+  deny:
+    - {node: frontend, path: /admin/*}

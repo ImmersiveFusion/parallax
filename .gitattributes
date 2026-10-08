@@ -1,0 +1,3 @@
+# Normalize to LF everywhere: CI runs on Linux and the shell scripts need LF.
+* text=auto eol=lf
+*.sh text eol=lf
