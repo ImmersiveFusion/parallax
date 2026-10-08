@@ -14,26 +14,26 @@ Use it as a continuous check that your services answer, or as a CI step that fai
 - **Paced.** In continuous mode, calls are spread across the interval with jitter. A single pass (`-once`) is paced by `run.maxCallsPerSecond`.
 - **Exports to any OTLP/gRPC receiver.** Point `-endpoint` at an OpenTelemetry Collector or any backend that accepts OTLP over gRPC.
 
-> **Status: early release (v0.1.0).** The manifest format and flags may still change between minor versions.
+> **Status: early release.** The manifest format and flags may still change between minor versions.
 
 ## Install
 
 Pick one:
 
-- **Release binary.** [v0.1.0](https://github.com/ImmersiveFusion/parallax/releases/tag/v0.1.0) has static binaries for Linux (`amd64`, `arm64`), macOS (`arm64`) and Windows (`amd64`), with a `SHA256SUMS` file.
+- **Release binary.** Each [release](https://github.com/ImmersiveFusion/parallax/releases/latest) has static binaries for Linux (`amd64`, `arm64`), macOS (`arm64`) and Windows (`amd64`), with a `SHA256SUMS` file.
 
   ```sh
-  curl -LO https://github.com/ImmersiveFusion/parallax/releases/download/v0.1.0/parallax-linux-amd64
-  curl -LO https://github.com/ImmersiveFusion/parallax/releases/download/v0.1.0/SHA256SUMS
+  curl -LO https://github.com/ImmersiveFusion/parallax/releases/latest/download/parallax-linux-amd64
+  curl -LO https://github.com/ImmersiveFusion/parallax/releases/latest/download/SHA256SUMS
   sha256sum -c --ignore-missing SHA256SUMS   # on macOS: grep darwin-arm64 SHA256SUMS | shasum -a 256 -c
   chmod +x parallax-linux-amd64 && mv parallax-linux-amd64 parallax
   ```
 
-- **Container image.** [`immersivefusion/parallax`](https://hub.docker.com/r/immersivefusion/parallax) on Docker Hub, for `linux/amd64` and `linux/arm64`, tagged `0.1.0`, `0.1` and `latest`. The image's entrypoint is the binary, so it takes the same flags. Mount your manifest:
+- **Container image.** [`immersivefusion/parallax`](https://hub.docker.com/r/immersivefusion/parallax) on Docker Hub, for `linux/amd64` and `linux/arm64`. `latest` follows the newest release, and each release also publishes a matching semantic-version tag. The image's entrypoint is the binary, so it takes the same flags. Mount your manifest:
 
   ```sh
   docker run --rm -v "$PWD/examples/shop.yaml:/etc/parallax/parallax.yaml:ro" \
-    immersivefusion/parallax:0.1.0 -manifest /etc/parallax/parallax.yaml -dry-run
+    immersivefusion/parallax -manifest /etc/parallax/parallax.yaml -dry-run
   ```
 
 - **From source.** You need Go 1.25 or later.
@@ -103,7 +103,7 @@ Parallax adds no credentials of its own, so a route that needs authentication co
 | `-health-addr` | `:8080` | Address for `/readyz` and `/healthz` in continuous mode. Empty disables the server |
 | `-instance-id` | empty | `service.instance.id` for Parallax's own spans |
 | `-log-level` | `info` | `debug`, `info`, `warn` or `error`. Also read from `PARALLAX_LOG_LEVEL` |
-| `-version` | false | Print the version and exit (`parallax v0.1.0` for a release build, `parallax dev` for a source build) |
+| `-version` | false | Print the version and exit (`parallax v` plus the release version for a release build, `parallax dev` for a source build) |
 
 In continuous mode, `/readyz` turns green once Parallax has started. `/healthz` stays green only while passes keep completing, and reports stale after three intervals without one, so a hung process can be restarted. Both report Parallax's own health, not your services': `/healthz` stays green when every call in a pass goes unanswered. In continuous mode, unanswered calls show up as warnings on stderr, as error-status probe spans, and in `-results`, never in the exit code or the health endpoints. The default `:8080` listens on all interfaces; set `-health-addr 127.0.0.1:8080` to keep it local, or leave it empty to turn it off. If the address cannot be bound, Parallax logs the error and keeps walking, so the probes below will fail rather than Parallax. In Kubernetes:
 
