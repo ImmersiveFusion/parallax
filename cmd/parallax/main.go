@@ -3,7 +3,8 @@
 // exports its own client spans over OTLP.
 //
 // Exit codes: 0 all calls answered (or dry run printed), 1 at least one call
-// unanswered (-once), 2 bad configuration or manifest.
+// unanswered (-once), 2 bad configuration or manifest, 3 interrupted before the
+// pass completed (-once).
 package main
 
 import (
@@ -11,8 +12,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -49,6 +50,10 @@ func run(args []string) int {
 		instance     = fs.String("instance-id", "", "service.instance.id for Parallax's own spans")
 		logLevel     = fs.String("log-level", envOr("PARALLAX_LOG_LEVEL", "info"), "debug, info, warn or error (env PARALLAX_LOG_LEVEL)")
 		showVersion  = fs.Bool("version", false, "print the version and exit")
+		maxInFlight  = fs.Int("max-in-flight", runner.DefaultMaxInFlight, "most calls open at once; a call beyond it is skipped and reported, never queued")
+		spread       = fs.Bool("spread", false, "with -once, spread the calls across run.interval with jitter instead of pacing at the rate limit")
+		allowLL      = fs.Bool("allow-link-local", false, "allow calls to link-local and cloud metadata addresses, which the egress guard refuses by default")
+		insecureHdrs = fs.Bool("allow-insecure-headers", false, "allow -insecure with OTLP headers to a non-loopback endpoint (sends them in cleartext)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -75,7 +80,7 @@ func run(args []string) int {
 
 	var m *manifest.Manifest
 	if *manifestPath == "-" {
-		b, rerr := io.ReadAll(io.LimitReader(os.Stdin, 16<<20))
+		b, rerr := manifest.ReadLimited(os.Stdin)
 		if rerr != nil {
 			fmt.Fprintf(os.Stderr, "parallax: read manifest from stdin: %v\n", rerr)
 			return 2
@@ -113,6 +118,14 @@ func run(args []string) int {
 		fmt.Fprintf(os.Stderr, "parallax: -headers: %v\n", err)
 		return 2
 	}
+	if *insecureOTLP && len(hdrs) > 0 && !*insecureHdrs && !isLoopback(*endpoint) {
+		fmt.Fprintln(os.Stderr, "parallax: refusing to send OTLP headers in cleartext (-insecure) to a non-loopback endpoint; use TLS, or pass -allow-insecure-headers")
+		return 2
+	}
+	if *maxInFlight < 1 || *maxInFlight > 4096 {
+		fmt.Fprintln(os.Stderr, "parallax: -max-in-flight must be between 1 and 4096")
+		return 2
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -132,9 +145,13 @@ func run(args []string) int {
 		}
 	}()
 
-	prober := probe.New(p.Name, p.Timeout)
+	var popts []probe.Option
+	if *allowLL {
+		popts = append(popts, probe.WithAllowLinkLocal())
+	}
+	prober := probe.New(p.Name, p.Timeout, popts...)
 	defer prober.Close()
-	r := &runner.Runner{Plan: p, Doer: prober, Log: log}
+	r := &runner.Runner{Plan: p, Doer: prober, Log: log, MaxInFlight: *maxInFlight, SpreadOnce: *spread}
 	var rep *report.Writer
 	if *results == "jsonl" {
 		rep = report.New(os.Stdout, p.Name)
@@ -154,8 +171,11 @@ func run(args []string) int {
 	if *once {
 		s := r.Once(ctx)
 		emit(s)
-		log.Info("pass complete", "calls", len(s.Results), "unanswered", s.Failed)
-		if s.Failed > 0 {
+		log.Info("pass complete", "calls", len(s.Results), "unanswered", s.Failed, "skipped", s.Skipped, "interrupted", s.Interrupted)
+		switch {
+		case s.Interrupted:
+			return 3
+		case s.Failed > 0:
 			return 1
 		}
 		return 0
@@ -169,7 +189,7 @@ func run(args []string) int {
 	mon.Ready()
 	r.Ambient(ctx, func(s runner.Summary) {
 		emit(s)
-		log.Info("pass complete", "pass", s.Pass, "calls", len(s.Results), "unanswered", s.Failed)
+		log.Info("pass complete", "pass", s.Pass, "calls", len(s.Results), "unanswered", s.Failed, "skipped", s.Skipped)
 	})
 	log.Info("parallax stopping")
 	return 0
@@ -181,6 +201,19 @@ func newLogger(level string) (*slog.Logger, error) {
 		return nil, fmt.Errorf("parallax: bad -log-level %q", level)
 	}
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: l})), nil
+}
+
+// isLoopback reports whether an OTLP endpoint (host:port) is on this machine.
+func isLoopback(endpoint string) bool {
+	host, _, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		host = endpoint
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func envOr(k, def string) string {

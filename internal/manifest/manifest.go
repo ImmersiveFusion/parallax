@@ -8,9 +8,13 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	"math"
+	"net"
 	"net/url"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +26,13 @@ const APIVersion = "parallax/v1"
 
 // Kind is the only manifest kind this engine understands.
 const Kind = "Manifest"
+
+// Hard limits, compiled in so no manifest can exceed them.
+const (
+	MaxManifestBytes  = 16 << 20       // A larger manifest is an error, never silently truncated.
+	MaxCallsPerSecond = 1000.0         // Ceiling for run.maxCallsPerSecond.
+	MaxInterval       = 24 * time.Hour // Ceiling for run.interval.
+)
 
 // Defaults applied when the run spec leaves a field empty.
 const (
@@ -102,17 +113,27 @@ type Rule struct {
 	Path string `yaml:"path"`
 }
 
-// Matches reports whether the rule covers a call to node at callPath.
+// Matches reports whether the rule covers a call to node at callPath. A bad
+// glob matches nothing; Validate rejects bad globs before this is reached.
 func (r Rule) Matches(node, callPath string) bool {
-	return globMatch(r.Node, node) && globMatch(r.Path, callPath)
+	return globMatch(r.Node, node, false) && globMatch(r.Path, callPath, false)
 }
 
-func globMatch(pattern, s string) bool {
+// Denies is Matches for a deny rule: a bad glob fails closed and matches
+// everything, so a broken deny rule can never let a call through.
+func (r Rule) Denies(node, callPath string) bool {
+	return globMatch(r.Node, node, true) && globMatch(r.Path, callPath, true)
+}
+
+func globMatch(pattern, s string, onError bool) bool {
 	if pattern == "" {
 		return true
 	}
 	ok, err := path.Match(pattern, s)
-	return err == nil && ok
+	if err != nil {
+		return onError
+	}
+	return ok
 }
 
 // Duration is a time.Duration that decodes from Go duration strings ("60s").
@@ -134,11 +155,30 @@ func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
 
 // Load reads, decodes, defaults and validates a manifest file.
 func Load(file string) (*Manifest, error) {
-	b, err := os.ReadFile(file) // #nosec G304 -- the operator names the manifest.
+	f, err := os.Open(file) // #nosec G304 -- the operator names the manifest.
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	b, err := ReadLimited(f)
 	if err != nil {
 		return nil, err
 	}
 	return Parse(b)
+}
+
+// ReadLimited reads a whole manifest, failing if it is larger than
+// MaxManifestBytes. Truncating instead could drop trailing deny rules from a
+// document that still parses.
+func ReadLimited(r io.Reader) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, MaxManifestBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > MaxManifestBytes {
+		return nil, fmt.Errorf("manifest is larger than %d bytes", MaxManifestBytes)
+	}
+	return b, nil
 }
 
 // Parse decodes, defaults and validates a manifest. Unknown fields are errors,
@@ -207,31 +247,40 @@ func (m *Manifest) Validate() error {
 		}
 		if h := n.HTTP; h != nil {
 			u, err := url.Parse(h.BaseURL)
-			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-				add("%s.http.baseURL %q must be an absolute http(s) URL", where, h.BaseURL)
+			switch {
+			case err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "":
+				add("%s.http.baseURL must be an absolute http(s) URL", where)
+			case u.User != nil:
+				// Never echo it: it holds credentials.
+				add("%s.http.baseURL must not contain credentials (user:pass@)", where)
+			case u.RawQuery != "" || u.Fragment != "" || strings.HasSuffix(h.BaseURL, "?"):
+				add("%s.http.baseURL %q must not contain a query or fragment", where, h.BaseURL)
 			}
 			for j, r := range h.Routes {
 				if r.Method == "" {
 					add("%s.http.routes[%d].method is required", where, j)
 				}
-				if !strings.HasPrefix(r.Path, "/") {
-					add("%s.http.routes[%d].path %q must start with /", where, j, r.Path)
+				if msg := checkRoutePath(r.Path); msg != "" {
+					add("%s.http.routes[%d].path %q %s", where, j, r.Path, msg)
 				}
 			}
 		}
-		if g := n.GRPC; g != nil && g.Target == "" {
-			add("%s.grpc.target is required", where)
+		if g := n.GRPC; g != nil {
+			if msg := checkGRPCTarget(g.Target); msg != "" {
+				add("%s.grpc.target %q %s", where, g.Target, msg)
+			}
 		}
 	}
 	r := m.Run
-	if r.Interval.Duration < time.Second {
-		add("run.interval must be at least 1s")
+	if r.Interval.Duration < time.Second || r.Interval.Duration > MaxInterval {
+		add("run.interval must be between 1s and %s", MaxInterval)
 	}
 	if r.Timeout.Duration <= 0 || r.Timeout.Duration > r.Interval.Duration {
 		add("run.timeout must be positive and no longer than run.interval")
 	}
-	if r.MaxCallsPerSecond <= 0 {
-		add("run.maxCallsPerSecond must be positive")
+	if math.IsNaN(r.MaxCallsPerSecond) || math.IsInf(r.MaxCallsPerSecond, 0) ||
+		r.MaxCallsPerSecond <= 0 || r.MaxCallsPerSecond > MaxCallsPerSecond {
+		add("run.maxCallsPerSecond must be a number above 0 and at most %g", MaxCallsPerSecond)
 	}
 	for i, rule := range append(append([]Rule{}, r.Allow...), r.Deny...) {
 		for _, p := range []string{rule.Node, rule.Path} {
@@ -241,4 +290,50 @@ func (m *Manifest) Validate() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// checkRoutePath returns why a route path is unsafe, or "". A path is sent as
+// written, and rules match it as written, so anything a server might resolve
+// differently from how a rule reads it (dot segments, doubled or escaped
+// slashes, percent-encoding, a query) is refused rather than normalized.
+func checkRoutePath(p string) string {
+	switch {
+	case !strings.HasPrefix(p, "/"):
+		return "must start with /"
+	case strings.Contains(p, "//"):
+		return "must not contain //"
+	case strings.ContainsAny(p, `?#\%`):
+		return `must not contain ?, #, \ or percent-encoding`
+	}
+	for _, r := range p {
+		if r < 0x21 || r == 0x7f {
+			return "must not contain spaces or control characters"
+		}
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "." || seg == ".." {
+			return "must not contain . or .. segments"
+		}
+	}
+	return ""
+}
+
+// checkGRPCTarget returns why a gRPC target is unusable, or "". Only host:port
+// is accepted: resolver schemes (unix:, dns://) could reach something the
+// manifest does not name.
+func checkGRPCTarget(t string) string {
+	if t == "" {
+		return "is required"
+	}
+	if strings.Contains(t, "/") {
+		return "must be host:port, without a scheme"
+	}
+	host, port, err := net.SplitHostPort(t)
+	if err != nil || host == "" {
+		return "must be host:port"
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+		return "must have a port between 1 and 65535"
+	}
+	return ""
 }

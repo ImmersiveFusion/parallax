@@ -33,6 +33,8 @@ type Call struct {
 	Method    string  `json:"method"`
 	Target    string  `json:"target"`
 	OK        bool    `json:"ok"`
+	NeedsAuth bool    `json:"needsAuth"`
+	Skipped   bool    `json:"skipped"`
 	Detail    string  `json:"detail"`
 	LatencyMS float64 `json:"latencyMs"`
 	TraceID   string  `json:"traceId"`
@@ -41,13 +43,15 @@ type Call struct {
 
 // Pass summarizes one pass.
 type Pass struct {
-	Type       string `json:"type"`
-	V          int    `json:"v"`
-	Run        string `json:"run"`
-	Pass       int    `json:"pass"`
-	Calls      int    `json:"calls"`
-	Unanswered int    `json:"unanswered"`
-	Time       string `json:"time"`
+	Type        string `json:"type"`
+	V           int    `json:"v"`
+	Run         string `json:"run"`
+	Pass        int    `json:"pass"`
+	Calls       int    `json:"calls"`
+	Unanswered  int    `json:"unanswered"`
+	Skipped     int    `json:"skipped"`
+	Interrupted bool   `json:"interrupted"`
+	Time        string `json:"time"`
 }
 
 // Writer emits JSON lines. It is safe for concurrent use.
@@ -75,7 +79,7 @@ func (w *Writer) WritePass(s runner.Summary) error {
 	}
 	return w.enc.Encode(Pass{
 		Type: "pass", V: Version, Run: w.run, Pass: s.Pass,
-		Calls: len(s.Results), Unanswered: s.Failed, Time: ts,
+		Calls: len(s.Results), Unanswered: s.Failed, Skipped: s.Skipped, Interrupted: s.Interrupted, Time: ts,
 	})
 }
 
@@ -87,7 +91,7 @@ func callLine(run string, pass int, r probe.Result, ts string) Call {
 	return Call{
 		Type: "call", V: Version, Run: run, Pass: pass,
 		Node: r.Call.Node, Kind: string(r.Call.Kind), Method: r.Call.Method, Target: target,
-		OK: r.OK, Detail: r.Detail,
+		OK: r.OK, NeedsAuth: r.NeedsAuth, Skipped: r.Skipped, Detail: r.Detail,
 		LatencyMS: float64(r.Latency.Microseconds()) / 1000,
 		TraceID:   r.TraceID, Time: ts,
 	}

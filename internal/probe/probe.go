@@ -9,9 +9,13 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"sync"
+	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -38,14 +42,27 @@ const (
 	AttrSynthetic = attribute.Key("parallax.synthetic")
 )
 
+// MaxDetail bounds Result.Detail, which carries remote text (a status line or
+// an error) and must not grow without limit.
+const MaxDetail = 512
+
 // Result is the outcome of one call.
 type Result struct {
-	Call    plan.Call
-	OK      bool
-	Detail  string // HTTP status, gRPC health status, or the error.
-	Latency time.Duration
-	TraceID string
+	Call      plan.Call
+	OK        bool   // The server answered (any HTTP status below 400, 401/403, or SERVING).
+	NeedsAuth bool   // Answered with 401 or 403: the route needs credentials Parallax does not send.
+	Skipped   bool   // Not started because the in-flight cap was reached; neither answered nor unanswered.
+	Detail    string // HTTP status, gRPC health status, or the error, truncated to MaxDetail bytes.
+	Latency   time.Duration
+	TraceID   string
 }
+
+// Option configures a Prober.
+type Option func(*Prober)
+
+// WithAllowLinkLocal lets calls reach link-local and cloud metadata addresses,
+// which the egress guard otherwise refuses.
+func WithAllowLinkLocal() Option { return func(p *Prober) { p.allowLinkLocal = true } }
 
 // Prober makes calls for one plan. It is safe for concurrent use.
 type Prober struct {
@@ -54,24 +71,62 @@ type Prober struct {
 	http    *http.Client
 	tracer  trace.Tracer
 
+	allowLinkLocal bool
+
 	mu    sync.Mutex
 	conns map[string]*grpc.ClientConn
 }
 
 // New returns a Prober. Spans go to the global tracer provider; trace context
 // is injected with the global propagator (see telemetry.Setup).
-func New(run string, timeout time.Duration) *Prober {
-	return &Prober{
+func New(run string, timeout time.Duration, opts ...Option) *Prober {
+	p := &Prober{
 		run:     run,
 		timeout: timeout,
-		http: &http.Client{
-			Transport: otelhttp.NewTransport(http.DefaultTransport),
-			// Never follow redirects: a redirect can leave the owned graph.
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		},
-		tracer: otel.Tracer(TracerName),
-		conns:  map[string]*grpc.ClientConn{},
+		tracer:  otel.Tracer(TracerName),
+		conns:   map[string]*grpc.ClientConn{},
 	}
+	for _, o := range opts {
+		o(p)
+	}
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	base.DialContext = p.dialer().DialContext
+	p.http = &http.Client{
+		Transport: otelhttp.NewTransport(base),
+		// Never follow redirects: a redirect can leave the owned graph.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	return p
+}
+
+// dialer applies the egress guard to every connection, after DNS resolution,
+// so a hostname that resolves to a metadata address is refused too.
+func (p *Prober) dialer() *net.Dialer {
+	d := &net.Dialer{Timeout: p.timeout, KeepAlive: 30 * time.Second}
+	if !p.allowLinkLocal {
+		d.Control = guardEgress
+	}
+	return d
+}
+
+// metadataAddrs are cloud metadata endpoints outside the link-local ranges.
+var metadataAddrs = map[netip.Addr]bool{
+	netip.MustParseAddr("100.100.100.200"): true, // Alibaba Cloud
+	netip.MustParseAddr("fd00:ec2::254"):   true, // AWS IMDS over IPv6
+}
+
+// guardEgress refuses link-local (which covers 169.254.169.254 and every other
+// link-local metadata service) and the metadata addresses above.
+func guardEgress(_, address string, _ syscall.RawConn) error {
+	ap, err := netip.ParseAddrPort(address)
+	if err != nil {
+		return fmt.Errorf("egress guard: cannot parse %q: %w", address, err)
+	}
+	ip := ap.Addr().Unmap()
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || metadataAddrs[ip] {
+		return fmt.Errorf("egress guard: %s is a link-local or cloud metadata address (use -allow-link-local to call it)", ip)
+	}
+	return nil
 }
 
 // Do makes one call and reports the result. It never panics on a bad target;
@@ -101,6 +156,7 @@ func (p *Prober) Do(ctx context.Context, c plan.Call) Result {
 		r = Result{Call: c, Detail: fmt.Sprintf("unknown call kind %q", c.Kind)}
 	}
 	r.Latency = time.Since(start)
+	r.Detail = truncate(r.Detail, MaxDetail)
 	r.TraceID = span.SpanContext().TraceID().String()
 	if r.OK {
 		span.SetStatus(codes.Ok, "")
@@ -111,6 +167,10 @@ func (p *Prober) Do(ctx context.Context, c plan.Call) Result {
 }
 
 func (p *Prober) doHTTP(ctx context.Context, c plan.Call) Result {
+	// The plan only derives GET and HEAD; refuse anything else here as well.
+	if c.Method != http.MethodGet && c.Method != http.MethodHead {
+		return Result{Call: c, Detail: "refused: " + c.Method + " is not repeat-safe"}
+	}
 	req, err := http.NewRequestWithContext(ctx, c.Method, c.URL, nil)
 	if err != nil {
 		return Result{Call: c, Detail: err.Error()}
@@ -122,7 +182,23 @@ func (p *Prober) doHTTP(ctx context.Context, c plan.Call) Result {
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		// The server answered; it wants credentials Parallax does not send.
+		return Result{Call: c, OK: true, NeedsAuth: true, Detail: resp.Status}
+	}
 	return Result{Call: c, OK: resp.StatusCode < 400, Detail: resp.Status}
+}
+
+// truncate cuts s to at most n bytes without splitting a UTF-8 sequence.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	s = s[:n]
+	for len(s) > 0 && !utf8.ValidString(s) {
+		s = s[:len(s)-1]
+	}
+	return s + "..."
 }
 
 func (p *Prober) doGRPCHealth(ctx context.Context, c plan.Call) Result {
@@ -155,6 +231,9 @@ func (p *Prober) conn(c plan.Call) (*grpc.ClientConn, error) {
 		grpc.WithTransportCredentials(creds),
 		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 		grpc.WithUserAgent("parallax"),
+		grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+			return p.dialer().DialContext(ctx, "tcp", addr)
+		}),
 	)
 	if err != nil {
 		return nil, err
