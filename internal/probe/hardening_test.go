@@ -11,11 +11,15 @@ import (
 	"github.com/ImmersiveFusion/parallax/internal/plan"
 )
 
+// testTimeout is generous on purpose: a 1s budget flaked when the whole suite
+// ran in parallel on Windows and a first local connection was slow.
+const testTimeout = 5 * time.Second
+
 func TestUnauthorizedAndForbiddenAreAnsweredAndNeedAuth(t *testing.T) {
 	setupTracing(t)
 	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden} {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(code) }))
-		res := New("t", time.Second).Do(context.Background(), plan.Call{Node: "svc", Kind: plan.KindHTTP, Method: "GET", URL: srv.URL})
+		res := New("t", testTimeout).Do(context.Background(), plan.Call{Node: "svc", Kind: plan.KindHTTP, Method: "GET", URL: srv.URL})
 		srv.Close()
 		if !res.OK || !res.NeedsAuth {
 			t.Fatalf("%d: want answered and needsAuth, got ok=%v needsAuth=%v", code, res.OK, res.NeedsAuth)
@@ -28,7 +32,7 @@ func TestNonRepeatSafeMethodIsRefusedEvenIfPlanned(t *testing.T) {
 	hit := false
 	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hit = true }))
 	defer srv.Close()
-	res := New("t", time.Second).Do(context.Background(), plan.Call{Node: "svc", Kind: plan.KindHTTP, Method: "POST", URL: srv.URL})
+	res := New("t", testTimeout).Do(context.Background(), plan.Call{Node: "svc", Kind: plan.KindHTTP, Method: "POST", URL: srv.URL})
 	if res.OK || hit {
 		t.Fatal("POST must never be sent")
 	}
@@ -64,7 +68,7 @@ func TestEgressGuard(t *testing.T) {
 func TestEgressGuardIsAppliedToRealDials(t *testing.T) {
 	setupTracing(t)
 	call := plan.Call{Node: "md", Kind: plan.KindHTTP, Method: "GET", URL: "http://169.254.169.254/latest/meta-data/"}
-	res := New("t", time.Second).Do(context.Background(), call)
+	res := New("t", testTimeout).Do(context.Background(), call)
 	if res.OK || !strings.Contains(res.Detail, "egress guard") {
 		t.Fatalf("the metadata address must be refused by the guard, got ok=%v %q", res.OK, res.Detail)
 	}
