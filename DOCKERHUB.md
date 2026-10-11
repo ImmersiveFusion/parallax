@@ -96,9 +96,11 @@ docker run --rm -v "$PWD/parallax.yaml:/etc/parallax/parallax.yaml:ro" \
 
 For a plaintext Collector on your own machine, add `-insecure` and use an address the container can reach: `localhost` inside the container is the container itself. On Docker Desktop that is `host.docker.internal:4317`; on Linux, run with `--network host` and use `localhost:4317`. Never combine `-insecure` with an API key over a network you do not control.
 
-Exit code 0 means the pass completed and every call was answered, 1 means at least one call was unanswered, and 2 means a bad manifest or configuration. A run stopped by `docker stop` or Ctrl-C mid-pass can currently also exit 0, so do not read 0 from an interrupted run as a pass. A failed span export is logged but never changes the exit code, so 0 says your services answered, not that the spans arrived. In `-once`, calls go out at up to `run.maxCallsPerSecond` (default 20), much faster than the continuous cadence the dry run reports.
+Exit code 0 means the pass completed and every call was answered, 1 means at least one call was unanswered, 2 means a bad manifest or configuration, and 3 means the pass was cut short by `docker stop` or Ctrl-C. A failed span export is logged but never changes the exit code, so 0 says your services answered, not that the spans arrived. In `-once`, calls go out at up to `run.maxCallsPerSecond` (default 20) with jitter, much faster than the continuous cadence the dry run reports; add `-spread` to spread them across the interval instead.
 
-A call counts as unanswered if it errors or times out, if an HTTP route returns status 400 or above, or if a gRPC health check returns anything other than `SERVING`. A 3xx counts as answered, because redirects are not followed: a route that redirects to a login page passes. Parallax adds no credentials of its own, so list only routes that answer without them. Keep secrets out of the manifest: a `baseURL` written as `https://user:pass@host` is sent as HTTP Basic auth, and every URL is printed as-is in the dry run, the logs and `-results`. HTTP calls honor `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY`.
+A call counts as unanswered if it errors or times out, if an HTTP route returns status 400 or above (other than 401 and 403), or if a gRPC health check returns anything other than `SERVING`. A 3xx counts as answered, because redirects are not followed: a route that redirects to a login page passes. Parallax adds no credentials of its own: a 401 or 403 did answer, so it counts as answered and is flagged `needsAuth` in `-results`. A call not started because `-max-in-flight` calls are already open is reported as skipped. Keep secrets out of the manifest: a `baseURL` with credentials (`https://user:pass@host`) or a query string is rejected, and every URL is printed as-is in the dry run, the logs and `-results`. HTTP calls honor `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY`.
+
+Parallax refuses to connect to link-local and cloud metadata addresses (such as `169.254.169.254`), checked after DNS resolution; pass `-allow-link-local` to allow them.
 
 Without `-once` or `-dry-run`, Parallax walks the graph continuously (every 60s by default) and serves `/readyz` and `/healthz` on port 8080 (publish it with `-p 8080:8080` if you need it outside the container; the image defines no Docker `HEALTHCHECK`). `/healthz` reports stale after three intervals without a completed pass, so a hung container can be restarted. Both endpoints report Parallax's own health, not your services': `/healthz` stays green when every call goes unanswered. In continuous mode, unanswered calls show up as warnings on stderr, as error-status probe spans, and in `-results`, never in the exit code or the health endpoints.
 
@@ -108,14 +110,16 @@ Without `-once` or `-dry-run`, Parallax walks the graph continuously (every 60s 
 |---|---|---|
 | `-manifest` | (required) | Path to a `parallax/v1` manifest, or `-` to read it from stdin |
 | `-dry-run` | false | Print the plan (blast radius, calls and refusals), then exit without sending anything |
-| `-once` | false | One pass, then exit with 0, 1 or 2 |
+| `-once` | false | One pass, then exit with 0, 1, 2 or 3 |
+| `-spread` | false | With `-once`, spread the calls across the interval with jitter |
+| `-max-in-flight` | `64` | Most calls open at once; a call beyond it is skipped and reported |
 | `-endpoint` | empty | OTLP/gRPC `host:port` for Parallax's own spans. Empty: trace context is still propagated, nothing is exported |
 | `-headers` | empty | OTLP headers `k=v,k=v`. Falls back to `OTEL_EXPORTER_OTLP_HEADERS`; prefer the variable so keys stay out of process lists. Never logged |
-| `-insecure` | false | Plaintext to the OTLP endpoint |
+| `-insecure` | false | Plaintext to the OTLP endpoint; refused with headers unless the endpoint is loopback (override with `-allow-insecure-headers`) |
 | `-results` | empty | `jsonl`: one JSON object per call and per pass on stdout |
 | `-health-addr` | `:8080` | Address for `/readyz` and `/healthz` in continuous mode. Empty disables the server |
 
-`run.maxCallsPerSecond` (default `20`) is an average budget: a graph whose calls cannot fit the interval at that rate is rejected when the plan is built.
+`run.maxCallsPerSecond` (default `20`, at most `1000`) is an average budget: a graph whose calls cannot fit the interval at that rate is rejected when the plan is built. Hard limits no manifest can raise: 16 MiB per manifest, 10,000 calls per pass, 1,000 gRPC targets, and an interval of at most 24 hours.
 
 The full flag list, manifest reference, span attributes and results format are in the [README on GitHub](https://github.com/ImmersiveFusion/parallax#readme).
 

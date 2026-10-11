@@ -81,6 +81,21 @@ func TestExitCodes(t *testing.T) {
 	}
 }
 
+func TestInsecureHeadersRefusedOffLoopback(t *testing.T) {
+	m := writeManifest(t, manifestFor("http://127.0.0.1:1", true))
+	if code := run([]string{"-manifest", m, "-once", "-insecure", "-endpoint", "collector.example.com:4317", "-headers", "api-key=x"}); code != 2 {
+		t.Fatalf("cleartext headers off loopback: exit %d, want 2", code)
+	}
+	if code := run([]string{"-manifest", m, "-once", "-max-in-flight", "0"}); code != 2 {
+		t.Fatalf("bad -max-in-flight: exit %d, want 2", code)
+	}
+	for ep, want := range map[string]bool{"localhost:4317": true, "127.0.0.1:4317": true, "[::1]:4317": true, "otlp.example.com:443": false} {
+		if isLoopback(ep) != want {
+			t.Errorf("isLoopback(%q) = %v, want %v", ep, !want, want)
+		}
+	}
+}
+
 func TestEnvOr(t *testing.T) {
 	t.Setenv("PARALLAX_TEST_X", "")
 	if envOr("PARALLAX_TEST_X", "d") != "d" {

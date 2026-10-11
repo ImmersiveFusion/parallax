@@ -64,6 +64,12 @@ type Plan struct {
 	MaxCPS   float64
 }
 
+// Hard limits on a derived plan, compiled in so no manifest can exceed them.
+const (
+	MaxCallsPerPass = 10000
+	MaxGRPCTargets  = 1000
+)
+
 // healthMethod is the full gRPC method of the standard health check.
 const healthMethod = "/grpc.health.v1.Health/Check"
 
@@ -87,6 +93,7 @@ func Derive(m *manifest.Manifest) (*Plan, error) {
 		Timeout:  m.Run.Timeout.Duration,
 		MaxCPS:   m.Run.MaxCallsPerSecond,
 	}
+	seen := map[string]bool{}
 	for _, n := range m.Graph.Nodes {
 		var candidates []Call
 		if h := n.HTTP; h != nil {
@@ -107,20 +114,30 @@ func Derive(m *manifest.Manifest) (*Plan, error) {
 			})
 		}
 		for _, c := range candidates {
+			key := c.String()
 			switch {
 			case !n.Owned:
 				p.skip(c, "node is not marked owned: Parallax never calls a system you don't own")
-			case matchesAny(m.Run.Deny, c):
+			case seen[key]:
+				p.skip(c, "duplicate of an earlier call")
+			case denied(m.Run.Deny, c):
 				p.skip(c, "denied by run.deny")
 			case len(m.Run.Allow) > 0 && !matchesAny(m.Run.Allow, c):
 				p.skip(c, "not matched by any run.allow rule")
 			default:
+				seen[key] = true
 				p.Calls = append(p.Calls, c)
 			}
 		}
 	}
 	if len(p.Calls) == 0 {
 		return p, fmt.Errorf("plan %q has no callable targets (%d skipped); see the dry run", p.Name, len(p.Skipped))
+	}
+	if len(p.Calls) > MaxCallsPerPass {
+		return p, fmt.Errorf("plan %q has %d calls per pass, above the limit of %d", p.Name, len(p.Calls), MaxCallsPerPass)
+	}
+	if t := p.grpcTargets(); t > MaxGRPCTargets {
+		return p, fmt.Errorf("plan %q has %d distinct gRPC targets, above the limit of %d", p.Name, t, MaxGRPCTargets)
 	}
 	if need := p.RequiredCPS(); need > p.MaxCPS {
 		return p, fmt.Errorf("plan %q needs %.2f calls/s to cover %d calls every %s, above run.maxCallsPerSecond %.2f: raise the interval or narrow the graph",
@@ -136,6 +153,26 @@ func (p *Plan) RequiredCPS() float64 {
 
 func (p *Plan) skip(c Call, reason string) {
 	p.Skipped = append(p.Skipped, Skip{Node: c.Node, What: c.String(), Reason: reason})
+}
+
+func (p *Plan) grpcTargets() int {
+	t := map[string]bool{}
+	for _, c := range p.Calls {
+		if c.Kind == KindGRPCHealth {
+			t[fmt.Sprintf("%s|%t", c.Target, c.Insecure)] = true
+		}
+	}
+	return len(t)
+}
+
+// denied reports whether any deny rule covers the call; a broken rule denies.
+func denied(rules []manifest.Rule, c Call) bool {
+	for _, r := range rules {
+		if r.Denies(c.Node, c.Path) {
+			return true
+		}
+	}
+	return false
 }
 
 func matchesAny(rules []manifest.Rule, c Call) bool {
