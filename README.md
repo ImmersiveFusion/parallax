@@ -87,22 +87,26 @@ Logs go to stderr: each pass ends with a `pass complete` line giving the call co
 
 A call counts as unanswered if it errors or times out, if an HTTP route returns status 400 or above (other than 401 and 403, below), or if a gRPC health check returns anything other than `SERVING`. A 3xx counts as answered, because the redirect is not followed. Parallax reads at most 1 MiB of each response body and discards it.
 
-Parallax adds no credentials of its own. A route that returns 401 or 403 did answer, so it counts as answered and is flagged `needsAuth` in `-results`; list routes that answer without credentials if you want them checked end to end. A call that is not started because `-max-in-flight` calls are already open is reported as skipped: neither answered nor unanswered.
+Parallax adds no credentials of its own. A route that returns 401 or 403 did answer, so it counts as answered and is flagged `needsAuth` in `-results`; list routes that answer without credentials if you want them checked end to end. A call that is not started because `-max-in-flight` calls are already open is reported as skipped: neither answered nor unanswered, and it does not change the exit code.
 
-Keep secrets out of the manifest: a `baseURL` that carries credentials (`https://user:pass@host`) or a query string is rejected, and every URL is printed as-is in the dry run, the logs and `-results`. Route paths are sent and matched exactly as written, so paths that a server might resolve differently from how a rule reads them (`..` or `.` segments, `//`, percent-encoding, `?`, `#`, `\`, spaces or control characters) are rejected. TLS is verified against the system trust store, and HTTP calls honor the standard `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` variables.
+Keep secrets out of the manifest: a `baseURL` that carries credentials (`https://user:pass@host`), a query string or a fragment is rejected, and every URL is printed as-is in the dry run, the logs and `-results`. Route paths are sent and matched exactly as written, so paths that a server might resolve differently from how a rule reads them (`..` or `.` segments, `//`, percent-encoding, `?`, `#`, `\`, spaces or control characters) are rejected. TLS is verified against the system trust store, and HTTP calls honor the standard `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` variables.
 
-**Egress guard.** Parallax refuses to connect to link-local addresses (which include the `169.254.169.254` cloud metadata service) and to other known cloud metadata addresses, checked after DNS resolution so a hostname that resolves to one is refused too. Pass `-allow-link-local` if you really mean to call one.
+### Egress guard
+
+Parallax refuses to connect to link-local addresses (unicast and multicast, which include the `169.254.169.254` cloud metadata service), to the unspecified address (on Linux and macOS; on Windows Go turns it into loopback before the guard sees it), and to two other cloud metadata addresses, `100.100.100.200` and `fd00:ec2::254`. Other providers' metadata addresses outside those ranges are not on the list. The check runs on the address Parallax actually connects to, after DNS resolution, so a hostname that resolves to one of these is refused too. Pass `-allow-link-local` if you really mean to call one.
+
+It is a narrow guard, not general protection against server-side request forgery: loopback and private ranges are not restricted, and it applies to probe calls only, not to the OTLP exporter. **When HTTP calls go through a proxy** (`HTTP_PROXY` or `HTTPS_PROXY`), Parallax connects to the proxy, so the guard checks the proxy's address, not the target's: the proxy decides whether a metadata address is reached. gRPC health checks do not use the proxy, so they are guarded unless `-allow-link-local` is set, and in a network where only the proxy can reach your services they will fail.
 
 ## Flags
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `-manifest` | (required) | Path to a `parallax/v1` manifest, or `-` to read it from stdin |
-| `-dry-run` | false | Print the plan (blast radius, calls and refusals), then exit without sending anything. Exits 2 on a bad manifest, or if the plan is not runnable: no callable targets, or more calls per interval than `run.maxCallsPerSecond` allows |
-| `-once` | false | One pass, then exit: 0 when the pass completed and every call was answered, 1 if any call was unanswered, 2 bad configuration or manifest, 3 if the pass was cut short by `SIGINT` or `SIGTERM` |
+| `-dry-run` | false | Print the plan (blast radius, calls and refusals), then exit without sending anything. Exits 2 on a bad manifest, or if the plan is not runnable: no callable targets, more calls per interval than `run.maxCallsPerSecond` allows, or more than the [hard limits](#manifest-parallaxv1) allow |
+| `-once` | false | One pass, then exit: 0 when the pass completed and no call was unanswered, 1 if any call was unanswered, 2 bad configuration or manifest, 3 if the pass was cut short by `SIGINT` or `SIGTERM` |
 | `-spread` | false | With `-once`, spread the calls across `run.interval` with jitter instead of pacing at `run.maxCallsPerSecond`. For a supervisor that triggers one pass per interval |
 | `-max-in-flight` | `64` | Most calls open at once (1 to 4096). A call beyond it is skipped and reported, never queued, so one hung target cannot hold up the rest |
-| `-allow-link-local` | false | Turn off the [egress guard](#what-unanswered-means) for link-local and cloud metadata addresses |
+| `-allow-link-local` | false | Turn off the [egress guard](#egress-guard) entirely |
 | `-endpoint` | empty | OTLP/gRPC `host:port` for Parallax's own spans. Empty: trace context is still propagated, nothing is exported |
 | `-headers` | empty | OTLP headers `k=v,k=v`. Falls back to `OTEL_EXPORTER_OTLP_HEADERS`. Never logged |
 | `-insecure` | false | Plaintext to the OTLP endpoint. With headers (an API key) it is refused unless the endpoint is loopback, because the headers would travel in cleartext |
@@ -139,9 +143,9 @@ See [examples/shop.yaml](examples/shop.yaml). Decoding is strict: an unknown fie
 | `run.interval` | How often to walk the graph (default `60s`, between `1s` and `24h`) |
 | `run.timeout` | Per-call timeout (default `5s`, no longer than the interval) |
 | `run.maxCallsPerSecond` | Average rate budget (default `20`, at most `1000`). A graph whose calls cannot fit the interval at this average is rejected. It is checked when the plan is built, not enforced per call: jitter can briefly place calls closer together, and slow calls can overlap, up to `-max-in-flight` |
+| `run.allow` / `run.deny` | `{node, path}` globs. If any allow rule exists, a call must match one. Deny always wins |
 
 **Hard limits.** No manifest can exceed these: 16 MiB per manifest (a larger one is an error, never truncated), 10,000 calls per pass, 1,000 distinct gRPC targets, `run.maxCallsPerSecond` of 1,000 and `run.interval` of 24 hours. Identical calls are made once; the duplicates are listed as refused.
-| `run.allow` / `run.deny` | `{node, path}` globs. If any allow rule exists, a call must match one. Deny always wins |
 
 **Rule globs.** `node` and `path` use Go's [`path.Match`](https://pkg.go.dev/path#Match) syntax, and an empty field matches everything. A `*` does not cross a `/`, so `/admin/*` matches `/admin/users` but not `/admin/users/42`. `path` matches the route's `path` only, not any path inside `baseURL`: with `baseURL: http://svc/admin` and route `/users`, the path rules see `/users`. A gRPC health check matches against its full method, `/grpc.health.v1.Health/Check`.
 
@@ -151,14 +155,16 @@ Each call produces a `parallax probe <node>` span with the HTTP or gRPC client s
 
 An unanswered call still ends its probe span, with an error status. The client span's own status follows the protocol: a gRPC health check that answers `NOT_SERVING` is a successful RPC, so its client span is not an error.
 
-Spans leave the process only when `-endpoint` is set. Without it, trace context is still sent on every call. A failed export is logged but never changes the exit code, so a green `-once` run says your services answered, not that the spans arrived. Parallax samples every probe trace and marks it sampled in `traceparent`, so a service using a parent-based sampler records every Parallax call.
+Spans leave the process only when `-endpoint` is set. Without it, trace context is still sent on every call. A failed export is logged but never changes the exit code, so a green `-once` run says no call went unanswered, not that the spans arrived. Calls skipped because `-max-in-flight` calls were already open do not change the exit code, so in CI also fail the job when the pass line reports `skipped` above 0, or raise `-max-in-flight`. Parallax samples every probe trace and marks it sampled in `traceparent`, so a service using a parent-based sampler records every Parallax call.
 
 ## Results
 
 With `-results jsonl`, stdout during a run (`-once` or continuous, not `-dry-run`) carries nothing but JSON lines, so a supervising process can read it directly. Lines are written when a pass completes: its call lines, then its pass line, all stamped with that moment in `time`. In continuous mode that means a call's line arrives only after its whole pass completes, which can be up to about one interval plus `run.timeout` after the call was made. Every line has `type`, `v` (format version, currently `1`), `run`, `pass` and `time`.
 
-- `{"type":"call", ...}`, one per call, adds `node`, `kind`, `method`, `target`, `ok`, `needsAuth`, `skipped`, `detail` (at most 512 bytes), `latencyMs` and `traceId`.
+- `{"type":"call", ...}`, one per call, adds `node`, `kind`, `method`, `target`, `ok`, `needsAuth`, `skipped`, `detail` (cut to 512 bytes, then `...`), `latencyMs` and `traceId`.
 - `{"type":"pass", ...}`, one per pass after its calls, adds `calls`, `unanswered`, `skipped` and `interrupted`.
+
+A skipped call's line has `skipped: true`, `ok: false`, the `detail` `skipped: in-flight cap reached` and an empty `traceId`, and it has no probe span. The pass line's `calls` includes skipped calls, so answered calls are `calls - unanswered - skipped`. Filter on `skipped` before counting `ok: false` as unanswered.
 
 On a call line, `kind` is `http` or `grpc-health`. For HTTP, `method` is the HTTP method and `target` the full URL. For a health check, `method` is `/grpc.health.v1.Health/Check` and `target` the gRPC `host:port`. `detail` is the HTTP status, the health status, or the error. From a local three-call pass in which one target was not listening (the repo's `tools/gatetarget` test service answering two of the calls). The loopback addresses are that test setup's, and the error text in `detail` comes from the operating system, so yours will differ:
 
